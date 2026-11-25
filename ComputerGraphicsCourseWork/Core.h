@@ -7,6 +7,8 @@
 #pragma comment ( lib , "dxgi" )
 #pragma comment ( lib , "d3dcompiler.lib" )
 
+#include <unordered_map >
+
 
 class Barrier
 {
@@ -71,6 +73,8 @@ public:
 
 	D3D12_VIEWPORT viewport;
 	D3D12_RECT scissorRect;
+
+	ID3D12RootSignature* rootSignature;
 
 	void init(HWND hwnd, int _width, int _height)
 	{
@@ -209,6 +213,20 @@ public:
 		scissorRect.bottom = _height;
 
 
+		D3D12_ROOT_SIGNATURE_DESC desc = {};
+		desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+		ID3DBlob* serialized;
+		ID3DBlob* error;
+		D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+		device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
+		serialized->Release();
+
+	}
+	void beginRenderPass()
+	{
+		getCommandList()->RSSetViewports(1, &viewport);
+		getCommandList()->RSSetScissorRects(1, &scissorRect);
+		getCommandList()->SetGraphicsRootSignature(rootSignature);
 	}
 	void resetCommandList()
 	{
@@ -237,9 +255,9 @@ public:
 		unsigned int frameIndex = swapchain->GetCurrentBackBufferIndex();
 		graphicsQueueFence[frameIndex].wait();
 
-		D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle = 
-			backbufferHeap ->GetCPUDescriptorHandleForHeapStart();
-		unsigned int renderTargetViewDescriptorSize = 
+		D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle =
+			backbufferHeap->GetCPUDescriptorHandleForHeapStart();
+		unsigned int renderTargetViewDescriptorSize =
 			device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 		renderTargetViewHandle.ptr += frameIndex * renderTargetViewDescriptorSize;
 
@@ -265,7 +283,126 @@ public:
 		graphicsQueueFence[frameIndex].signal(graphicsQueue);
 		swapchain->Present(1, 0);
 	}
-	
 
+	void uploadResource(ID3D12Resource* dstResource, const void* data, unsigned int size,
+		D3D12_RESOURCE_STATES targetState, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* texFootprint = NULL)
+	{
+		ID3D12Resource* uploadBuffer;
+		D3D12_HEAP_PROPERTIES heapProps = {};
+		heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+		D3D12_RESOURCE_DESC bufferDesc = {};
+		bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bufferDesc.Width = size;
+		bufferDesc.Height = 1;
+		bufferDesc.DepthOrArraySize = 1;
+		bufferDesc.MipLevels = 1;
+		bufferDesc.SampleDesc.Count = 1;
+		bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&uploadBuffer));
+
+		void* mappeddata = NULL;
+		uploadBuffer->Map(0, NULL, &mappeddata);
+		memcpy(mappeddata, data, size);
+		uploadBuffer->Unmap(0, NULL);
+
+		resetCommandList();
+
+		if (texFootprint != NULL)
+		{
+			D3D12_TEXTURE_COPY_LOCATION src = {};
+			src.pResource = uploadBuffer;
+			src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+			src.PlacedFootprint = *texFootprint;
+			D3D12_TEXTURE_COPY_LOCATION dst = {};
+			dst.pResource = dstResource;
+			dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dst.SubresourceIndex = 0;
+			getCommandList()->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+		}
+		else
+		{
+			getCommandList()->CopyBufferRegion(dstResource, 0, uploadBuffer, 0, size);
+		}
+
+		Barrier::add(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, targetState, getCommandList());
+		runCommandList();
+		flushGraphicsQueue();
+		uploadBuffer->Release();
+
+
+	}
 };
+
+
+
+class PSOManager
+{
+public:
+	std::unordered_map <std::string, ID3D12PipelineState*> psos;
+	void createPSO(Core* core, std::string name, ID3DBlob* vs, ID3DBlob* ps, D3D12_INPUT_LAYOUT_DESC layout)
+	{
+		if (psos.find(name) != psos.end())
+		{
+			return;
+		}
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+		desc.InputLayout = layout;
+		desc.pRootSignature = core->rootSignature;
+		desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+		desc.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+
+		D3D12_RASTERIZER_DESC rasterDesc = {};
+		rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
+		rasterDesc.CullMode = D3D12_CULL_MODE_NONE;
+		rasterDesc.FrontCounterClockwise = FALSE;
+		rasterDesc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+		rasterDesc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+		rasterDesc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+		rasterDesc.DepthClipEnable = TRUE;
+		rasterDesc.MultisampleEnable = FALSE;
+		rasterDesc.AntialiasedLineEnable = FALSE;
+		rasterDesc.ForcedSampleCount = 0;
+		rasterDesc.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+		desc.RasterizerState = rasterDesc;
+
+		D3D12_DEPTH_STENCIL_DESC depthStencilDesc = {};
+		depthStencilDesc.DepthEnable = TRUE;
+		depthStencilDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+		depthStencilDesc.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+		depthStencilDesc.StencilEnable = FALSE;
+		desc.DepthStencilState = depthStencilDesc;
+
+		D3D12_BLEND_DESC blendDesc = {};
+		blendDesc.AlphaToCoverageEnable = FALSE;
+		blendDesc.IndependentBlendEnable = FALSE;
+		const D3D12_RENDER_TARGET_BLEND_DESC defaultRenderTargetBlend = {
+		FALSE , FALSE ,
+		D3D12_BLEND_ONE , D3D12_BLEND_ZERO , D3D12_BLEND_OP_ADD ,
+		D3D12_BLEND_ONE , D3D12_BLEND_ZERO , D3D12_BLEND_OP_ADD ,
+		D3D12_LOGIC_OP_NOOP ,
+		D3D12_COLOR_WRITE_ENABLE_ALL
+		};
+		for (int i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+		{
+			blendDesc.RenderTarget[i] = defaultRenderTargetBlend;
+		}
+		desc.BlendState = blendDesc;
+
+		desc.SampleMask = UINT_MAX;
+		desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		desc.NumRenderTargets = 1;
+		desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+		desc.SampleDesc.Count = 1;ID3D12PipelineState* pso;
+		HRESULT hr = core->device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+		psos.insert({ name, pso });
+
+	}
+	void bind(Core* core, std::string name) {
+		core->getCommandList()->SetPipelineState(psos[name]);
+	}
+};
+
+
 
